@@ -49,12 +49,30 @@ const EMPTY_HISTORY: CollaborationHistory = {
   contributors: []
 };
 
+function unpackChatMessage(msg: any): CollaborationMessage {
+  if (!msg || typeof msg !== 'object') return msg;
+  let content = typeof msg.content === 'string' ? msg.content : '';
+  let imageUrl = msg.imageUrl || null;
+  const imgMatch = content.match(/\n?<!--IMG:(data:image\/[^>]*)-->/);
+  if (imgMatch) {
+    if (!imageUrl) {
+      imageUrl = imgMatch[1];
+    }
+    content = content.replace(/\n?<!--IMG:data:image\/[^>]*-->/g, '').trim();
+  }
+  return {
+    ...msg,
+    content,
+    imageUrl
+  };
+}
+
 function normalizeHistory(raw?: any): CollaborationHistory {
   if (!raw || typeof raw !== 'object') {
     return { messages: [], activities: [], contributors: [] };
   }
   return {
-    messages: Array.isArray(raw.messages) ? raw.messages : [],
+    messages: Array.isArray(raw.messages) ? raw.messages.map(unpackChatMessage) : [],
     activities: Array.isArray(raw.activities) ? raw.activities : [],
     contributors: Array.isArray(raw.contributors) ? raw.contributors : []
   };
@@ -188,7 +206,9 @@ export const useWebSocket = (): UseWebSocketReturn => {
       }
 
       case 'CHAT_MESSAGE_RECEIVED': {
-        const chatMsg: CollaborationMessage | undefined = payload?.message;
+        const chatMsg: CollaborationMessage | undefined = payload?.message
+          ? unpackChatMessage(payload.message)
+          : undefined;
         const curHist = historyRef.current;
         let nextHistory = curHist;
         if (payload?.history) {
@@ -441,12 +461,17 @@ export const useWebSocket = (): UseWebSocketReturn => {
       return;
     }
 
+    const packedContent = message.imageUrl
+      ? `${message.content || ''}\n<!--IMG:${message.imageUrl}-->`
+      : message.content;
+
     const fullMsg: CollaborationMessage = {
       id: message.id || `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       senderId: message.senderId,
       senderName: message.senderName,
       senderRole: message.senderRole,
-      content: message.content,
+      content: packedContent,
+      imageUrl: message.imageUrl || null,
       replyToUser: message.replyToUser || null,
       actionSummary: message.actionSummary || null,
       timestamp: message.timestamp || new Date().toISOString()

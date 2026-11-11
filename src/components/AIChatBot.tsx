@@ -24,6 +24,54 @@ interface AIChatBotProps {
   isEmbedded?: boolean;
 }
 
+const compressImageFile = (file: File, maxDim = 1200, quality = 0.82): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target?.result as string;
+      if (!dataUrl) {
+        reject(new Error('No se pudo leer la imagen'));
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        try {
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            if (width > height) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            } else {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(dataUrl);
+            return;
+          }
+          // Fondo blanco por si es PNG transparente con trazos oscuros
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', quality);
+          resolve(compressed);
+        } catch {
+          resolve(dataUrl);
+        }
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    };
+    reader.onerror = () => reject(new Error('Error leyendo archivo de imagen'));
+    reader.readAsDataURL(file);
+  });
+};
+
 const AIChatBot: React.FC<AIChatBotProps> = ({
   onDiagramGenerated,
   currentDiagram,
@@ -36,13 +84,16 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
 }) => {
   const [localMessages, setLocalMessages] = useState<CollaborationMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [selectedImageName, setSelectedImageName] = useState<string>('');
+  const [previewModalImage, setPreviewModalImage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isExpanded, setIsExpanded] = useState(isEmbedded);
   const [isClient, setIsClient] = useState(false);
-  const [aiAlwaysAttentive, setAiAlwaysAttentive] = useState(true);
   const [showHistoryDrawer, setShowHistoryDrawer] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const userName = currentUser?.nombre || 'Invitado';
   const userId = currentUser?.id || 'guest';
@@ -58,7 +109,7 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
       senderId: 'ai-mentor',
       senderName: 'Mentor IA',
       senderRole: 'system',
-      content: `¡Hola ${userName}! Soy el **Mentor IA** del grupo. Estoy atento al chat de la sala, sé quién escribe cada mensaje y conozco todo el historial del proyecto. Pueden pedirme crear/editar tablas, explicaciones de conceptos UML o preguntarme quién trabajó en el proyecto.`,
+      content: `¡Hola ${userName}! Este es el **Chat Grupal** de la sala. Pueden conversar y compartir imágenes libremente entre compañeros.\n\nPara consultarme, escribe **@ia** seguido de tu mensaje o adjunta una imagen con **@ia** (puedo ver fotos de diagramas, bocetos a mano y crear o editar sus tablas en tiempo real).`,
       timestamp: new Date().toISOString()
     };
 
@@ -137,29 +188,147 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
     scrollToBottom();
   }, [displayedMessages.length, isLoading]);
 
-  const processUserMessage = useCallback(
-    async (rawText: string) => {
-      const trimmed = rawText.trim();
-      if (!trimmed || isLoading) return;
+  const handleImageFile = useCallback(async (file: File) => {
+    if (!file.type.startsWith('image/')) return;
+    try {
+      const compressedDataUrl = await compressImageFile(file);
+      setSelectedImage(compressedDataUrl);
+      setSelectedImageName(file.name || 'imagen.jpg');
+      inputRef.current?.focus();
+    } catch (err) {
+      console.error('Error al cargar imagen en el chat:', err);
+    }
+  }, []);
 
-      // 1. Publicar el mensaje del usuario en el chat grupal (sala + historial)
+  const handleFileInputChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        await handleImageFile(file);
+      }
+      if (e.target) {
+        e.target.value = '';
+      }
+    },
+    [handleImageFile]
+  );
+
+  const handlePaste = useCallback(
+    async (e: React.ClipboardEvent<HTMLInputElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith('image/')) {
+          const file = items[i].getAsFile();
+          if (file) {
+            e.preventDefault();
+            await handleImageFile(file);
+            break;
+          }
+        }
+      }
+    },
+    [handleImageFile]
+  );
+
+  const handleInsertAIMention = useCallback(() => {
+    setInputValue((prev) => {
+      if (/(^|\s)@ia\b/i.test(prev)) {
+        return prev;
+      }
+      return prev.trim() ? `@ia ${prev}` : '@ia ';
+    });
+    inputRef.current?.focus();
+  }, []);
+
+  const processUserMessage = useCallback(
+    async (rawText: string, attachedImage?: string | null) => {
+      const trimmed = rawText.trim();
+      if ((!trimmed && !attachedImage) || isLoading) return;
+
+      // 1. Publicar el mensaje (y/o imagen) del usuario en el chat grupal (sala + historial)
       emitMessage({
         senderId: userId,
         senderName: userName,
         senderRole: 'user',
-        content: trimmed
+        content: trimmed || (attachedImage ? '📷 Imagen compartida en la sala' : ''),
+        imageUrl: attachedImage || null
       });
 
-      // Verificar si la IA debe intervenir (siempre activa o mencionada con @ia / @mentor)
-      const mentionsAI = /(@ia|@mentor|\bia\b|\bmentor\b)/i.test(trimmed);
-      if (!aiAlwaysAttentive && !mentionsAI) {
+      // 2. La IA SOLO interviene cuando se escribe @ia (o @mentor) en el mensaje
+      const mentionsAI = /(^|\s)(@ia|@mentor)\b/i.test(trimmed);
+      if (!mentionsAI) {
         return;
       }
 
-      const cleanCommand = trimmed.replace(/^(@ia|@mentor)\s*:?\s*/i, '').trim() || trimmed;
+      const cleanCommand = trimmed.replace(/(^|\s)(@ia|@mentor)\s*:?\s*/gi, ' ').trim();
       setIsLoading(true);
 
       try {
+        const collabContext = buildCollabContext();
+
+        // Buscar si hay imagen adjunta en este mensaje o si el usuario hace referencia a la última imagen del chat
+        let imageToAnalyze = attachedImage || null;
+        if (!imageToAnalyze && /(imagen|foto|captura|boceto|diagrama de la foto)/i.test(cleanCommand)) {
+          const recentWithImage = [...displayedMessages]
+            .reverse()
+            .find((m) => !!m.imageUrl);
+          if (recentWithImage?.imageUrl) {
+            imageToAnalyze = recentWithImage.imageUrl;
+          }
+        }
+
+        // Caso A: Consulta a @ia con imagen (visión + extracción/modificación de diagrama)
+        if (imageToAnalyze) {
+          const imgResponse = await AIService.analyzeChatImage(
+            imageToAnalyze,
+            cleanCommand,
+            currentDiagram,
+            collabContext
+          );
+
+          if (imgResponse.success) {
+            emitMessage({
+              senderId: 'ai-mentor',
+              senderName: 'Mentor IA',
+              senderRole: 'ai',
+              replyToUser: userName,
+              content:
+                imgResponse.response ||
+                `¡Listo ${userName}! He analizado la imagen que compartiste en el chat.`,
+              actionSummary: imgResponse.actionSummary || null
+            });
+
+            if (imgResponse.updatedDiagram) {
+              onDiagramGenerated(
+                imgResponse.updatedDiagram,
+                imgResponse.actionSummary || 'Actualizó diagrama a partir de una imagen en el chat'
+              );
+            }
+          } else {
+            emitMessage({
+              senderId: 'ai-mentor',
+              senderName: 'Mentor IA',
+              senderRole: 'ai',
+              replyToUser: userName,
+              content: `${userName}, no pude procesar la imagen: ${imgResponse.error || 'Intenta con otra imagen más clara.'}`
+            });
+          }
+          return;
+        }
+
+        // Si escribió solo "@ia" sin texto ni imagen
+        if (!cleanCommand) {
+          emitMessage({
+            senderId: 'ai-mentor',
+            senderName: 'Mentor IA',
+            senderRole: 'ai',
+            replyToUser: userName,
+            content: `¡Hola **${userName}**! Escribe tu consulta después de **@ia** (por ejemplo: \`@ia agrega la tabla Pago\` o adjunta una foto de tu diagrama junto con \`@ia\`).`
+          });
+          return;
+        }
+
         const localHelp = getHelpResponse(cleanCommand);
         if (localHelp) {
           emitMessage({
@@ -173,7 +342,6 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
           return;
         }
 
-        const collabContext = buildCollabContext();
         const intent = AIService.detectUserIntent(cleanCommand, !!currentDiagram);
 
         if (intent === 'modify' && currentDiagram) {
@@ -277,9 +445,9 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
       emitMessage,
       userId,
       userName,
-      aiAlwaysAttentive,
       buildCollabContext,
       currentDiagram,
+      displayedMessages,
       onDiagramGenerated
     ]
   );
@@ -288,22 +456,27 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
     if (isListening) {
       stopListening();
       if (transcript) {
-        processUserMessage(transcript);
+        processUserMessage(transcript, selectedImage);
+        setSelectedImage(null);
+        setSelectedImageName('');
       }
     } else {
       startListening();
     }
-  }, [isListening, stopListening, startListening, transcript, processUserMessage]);
+  }, [isListening, stopListening, startListening, transcript, processUserMessage, selectedImage]);
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      if (!inputValue.trim() || isLoading) return;
+      if ((!inputValue.trim() && !selectedImage) || isLoading) return;
       const text = inputValue.trim();
+      const img = selectedImage;
       setInputValue('');
-      await processUserMessage(text);
+      setSelectedImage(null);
+      setSelectedImageName('');
+      await processUserMessage(text, img);
     },
-    [inputValue, isLoading, processUserMessage]
+    [inputValue, selectedImage, isLoading, processUserMessage]
   );
 
   const handleSuggestImprovements = useCallback(async () => {
@@ -314,7 +487,7 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
       senderId: userId,
       senderName: userName,
       senderRole: 'user',
-      content: '¿Puedes revisar nuestro diagrama actual y darnos mentoría sobre qué mejorar?'
+      content: '@ia ¿Puedes revisar nuestro diagrama actual y darnos mentoría sobre qué mejorar?'
     });
 
     try {
@@ -349,19 +522,19 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
 
   const handleAskWhoWorked = useCallback(async () => {
     if (isLoading) return;
-    await processUserMessage('¿Quiénes trabajaron en este proyecto y qué aportes o cambios hizo cada integrante?');
+    await processUserMessage('@ia ¿Quiénes trabajaron en este proyecto y qué aportes o cambios hizo cada integrante?');
   }, [isLoading, processUserMessage]);
 
   const examplePrompts = [
-    'Sistema de ventas con Producto, Cliente, Factura y DetalleFactura',
-    '¿Qué diferencia hay entre composición y agregación en nuestro diagrama?',
-    '¿Cómo deberíamos normalizar estas tablas en 3FN?'
+    '@ia Sistema de ventas con Producto, Cliente, Factura y DetalleFactura',
+    '@ia ¿Qué diferencia hay entre composición y agregación en nuestro diagrama?',
+    '@ia ¿Cómo deberíamos normalizar estas tablas en 3FN?'
   ];
 
   const modificationExamples = [
-    'Agrega la tabla Categoria con id y nombre y relaciónala con Producto',
-    '¿Qué mejoras de diseño nos recomiendas como mentor?',
-    '¿Quiénes trabajaron en este proyecto y qué cambios hicieron?'
+    '@ia Agrega la tabla Categoria con id y nombre y relaciónala con Producto',
+    '@ia ¿Qué mejoras de diseño nos recomiendas como mentor?',
+    '@ia ¿Quiénes trabajaron en este proyecto y qué cambios hicieron?'
   ];
 
   const handleExampleClick = useCallback((example: string) => {
@@ -396,7 +569,7 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
           : 'fixed bottom-4 right-4 w-96 h-[600px] bg-white rounded-3xl shadow-2xl border border-pink-200 flex flex-col z-50 overflow-hidden'
       } ${className}`}
     >
-      {/* Barra de estado del Chat Grupal + Identidad + Modo Mentor */}
+      {/* Barra de estado del Chat Grupal + Identidad + Invocación @ia */}
       <div className="bg-gradient-to-r from-pink-50 via-rose-50/70 to-pink-50 px-3 py-2 border-b border-pink-200 flex flex-col gap-1.5">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 min-w-0">
@@ -451,23 +624,18 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
           </div>
         </div>
 
-        {/* Selector de Atención del Mentor IA */}
+        {/* Guía rápida de invocación con @ia */}
         <div className="flex items-center justify-between text-[10px] pt-0.5 border-t border-pink-200/60">
           <span className="text-slate-600 font-medium">
-            {aiAlwaysAttentive
-              ? '🤖 Mentor IA atento a todos los mensajes'
-              : '💬 Solo chat entre compañeros (usa @ia para invocar)'}
+            💬 Usa <strong className="text-[#EC407A]">@ia</strong> + mensaje o imagen para consultar a la IA
           </span>
           <button
             type="button"
-            onClick={() => setAiAlwaysAttentive((prev) => !prev)}
-            className={`px-2 py-0.5 rounded-full font-semibold transition-colors border ${
-              aiAlwaysAttentive
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
-                : 'bg-slate-100 text-slate-600 border-slate-300 hover:bg-slate-200'
-            }`}
+            onClick={handleInsertAIMention}
+            className="px-2 py-0.5 rounded-full font-bold transition-colors border bg-pink-100 text-[#EC407A] border-pink-300 hover:bg-pink-200"
+            title="Insertar @ia en el mensaje"
           >
-            {aiAlwaysAttentive ? 'IA Activa' : 'Solo Grupo'}
+            + @ia
           </button>
         </div>
       </div>
@@ -591,7 +759,19 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
                     : 'bg-white text-slate-800 border border-pink-200/90 shadow-xs rounded-2xl rounded-tl-xs'
                 }`}
               >
-                <div className="whitespace-pre-wrap">{message.content}</div>
+                {message.imageUrl && (
+                  <div className="mb-2">
+                    <img
+                      src={message.imageUrl}
+                      alt="Imagen adjunta en el chat"
+                      onClick={() => setPreviewModalImage(message.imageUrl || null)}
+                      className="max-h-48 w-auto rounded-xl border border-white/30 object-contain cursor-pointer hover:opacity-95 transition-opacity bg-white/90 p-0.5"
+                      title="Haz clic para ampliar imagen"
+                    />
+                  </div>
+                )}
+
+                {message.content && <div className="whitespace-pre-wrap">{message.content}</div>}
 
                 {message.actionSummary && (
                   <div className="mt-2 pt-1.5 border-t border-pink-100 flex items-center gap-1 text-[10px] font-semibold text-emerald-700">
@@ -627,7 +807,7 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
                   ></div>
                 </div>
                 <span className="text-xs text-pink-700 font-semibold">
-                  Mentor IA respondiendo a {userName}...
+                  Mentor IA analizando para {userName}...
                 </span>
               </div>
             </div>
@@ -635,6 +815,30 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      {/* Modal para ver imagen en tamaño completo */}
+      {previewModalImage && (
+        <div
+          className="fixed inset-0 z-[100] bg-slate-900/80 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setPreviewModalImage(null)}
+        >
+          <div className="relative max-w-4xl max-h-[90vh] bg-white p-2 rounded-2xl shadow-2xl">
+            <button
+              type="button"
+              onClick={() => setPreviewModalImage(null)}
+              className="absolute -top-3 -right-3 w-8 h-8 rounded-full bg-[#EC407A] text-white font-bold flex items-center justify-center shadow-lg hover:bg-pink-700"
+              title="Cerrar vista previa"
+            >
+              ✕
+            </button>
+            <img
+              src={previewModalImage}
+              alt="Vista previa ampliada"
+              className="max-h-[85vh] max-w-full object-contain rounded-xl"
+            />
+          </div>
+        </div>
+      )}
 
       {/* Acciones Rápidas de Mentoría */}
       {currentDiagram && (
@@ -682,35 +886,88 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
 
       {/* Formulario de Entrada */}
       <form onSubmit={handleSubmit} className="p-3 border-t border-pink-200 bg-white">
-        {(inputValue.trim() || (isListening && transcript)) && (
+        {/* Vista previa de imagen adjunta antes de enviar */}
+        {selectedImage && (
+          <div className="mb-2 p-2 bg-pink-50/80 border border-pink-200 rounded-xl flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <img
+                src={selectedImage}
+                alt="Adjunto"
+                className="w-11 h-11 rounded-lg object-cover border border-pink-300 bg-white flex-shrink-0"
+              />
+              <div className="min-w-0 flex flex-col">
+                <span className="text-[11px] font-bold text-slate-800 truncate">
+                  {selectedImageName || 'Imagen adjunta'}
+                </span>
+                {/(^|\s)(@ia|@mentor)\b/i.test(inputValue) ? (
+                  <span className="text-[10px] font-semibold text-emerald-700">
+                    🤖 La IA verá y analizará esta imagen
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleInsertAIMention}
+                    className="text-left text-[10px] font-bold text-[#EC407A] hover:underline"
+                  >
+                    + Agregar @ia para que la IA analice la imagen
+                  </button>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedImage(null);
+                setSelectedImageName('');
+              }}
+              className="p-1 text-rose-600 hover:bg-rose-100 rounded-lg transition-colors flex-shrink-0"
+              title="Quitar imagen adjunta"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        {(inputValue.trim() || selectedImage || (isListening && transcript)) && (
           <div className="mb-2 text-xs text-pink-800 flex items-center gap-1.5 font-medium">
             {(() => {
               const text = isListening && transcript ? transcript : inputValue;
-              if (!aiAlwaysAttentive && !/(@ia|@mentor|\bia\b|\bmentor\b)/i.test(text)) {
+              const mentionsAI = /(^|\s)(@ia|@mentor)\b/i.test(text);
+              if (!mentionsAI) {
                 return (
                   <span className="inline-flex items-center gap-1 text-indigo-800 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200 text-[11px] font-semibold">
-                    💬 Mensaje solo para compañeros de sala
+                    💬 Mensaje para el grupo (escribe @ia para consultar a la IA)
                   </span>
                 );
               }
-              const intent = AIService.detectUserIntent(text, !!currentDiagram);
+              if (selectedImage) {
+                return (
+                  <span className="inline-flex items-center gap-1 text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-300 text-[11px] font-semibold">
+                    📷🤖 Analizar imagen con Mentor IA ({userName})
+                  </span>
+                );
+              }
+              const cleanText = text.replace(/(^|\s)(@ia|@mentor)\s*:?\s*/gi, ' ').trim();
+              const intent = AIService.detectUserIntent(cleanText || text, !!currentDiagram);
               if (intent === 'create') {
                 return (
                   <span className="inline-flex items-center gap-1 text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-300 text-[11px] font-semibold">
-                    ➕ Crear diagrama ({userName})
+                    ➕ Crear diagrama con @ia ({userName})
                   </span>
                 );
               }
               if (intent === 'modify') {
                 return (
                   <span className="inline-flex items-center gap-1 text-pink-800 bg-pink-100 px-2 py-0.5 rounded-full border border-pink-300 text-[11px] font-semibold">
-                    ✏️ Modificar diagrama ({userName})
+                    ✝︝ Modificar diagrama con @ia ({userName})
                   </span>
                 );
               }
               return (
                 <span className="inline-flex items-center gap-1 text-purple-800 bg-purple-50 px-2 py-0.5 rounded-full border border-purple-300 text-[11px] font-semibold">
-                  🎓 Consulta al Mentor IA ({userName})
+                  🎓 Consulta al Mentor @ia ({userName})
                 </span>
               );
             })()}
@@ -722,16 +979,47 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
           </div>
         )}
 
-        <div className="flex space-x-1.5">
+        <div className="flex space-x-1.5 items-center">
+          {/* Input oculto para subir imagen al chat */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleFileInputChange}
+            className="hidden"
+          />
+
+          {/* Botón para adjuntar imagen al chat */}
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoading || isListening}
+            className={`p-2.5 rounded-xl transition-colors flex items-center justify-center border ${
+              selectedImage
+                ? 'bg-pink-100 text-[#EC407A] border-pink-300'
+                : 'bg-pink-50 hover:bg-pink-100 text-pink-700 border-pink-200'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
+            title="Subir imagen al chat (usa @ia para que la IA la analice)"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+              <circle cx="8.5" cy="8.5" r="1.5" />
+              <polyline points="21 15 16 10 5 21" />
+            </svg>
+          </button>
+
           <input
             ref={inputRef}
             type="text"
             value={isListening ? transcript : inputValue}
             onChange={(e) => setInputValue(e.target.value)}
+            onPaste={handlePaste}
             placeholder={
               isListening
                 ? 'Escuchando voz...'
-                : `Escribe como ${userName} al grupo o pide algo al Mentor IA...`
+                : selectedImage
+                ? 'Escribe @ia para que la IA analice la imagen, o envía al grupo...'
+                : 'Escribe al grupo o usa @ia seguido de tu mensaje o imagen...'
             }
             className="flex-1 text-xs p-2.5 bg-pink-50/50 border border-pink-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#EC407A] focus:bg-white text-slate-800 placeholder-pink-300 transition-all"
             disabled={isLoading || isListening}
@@ -757,9 +1045,9 @@ const AIChatBot: React.FC<AIChatBotProps> = ({
 
           <button
             type="submit"
-            disabled={!inputValue.trim() || isLoading}
+            disabled={(!inputValue.trim() && !selectedImage) || isLoading}
             className="bg-[#EC407A] hover:bg-pink-700 text-white p-2.5 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-xs shadow-pink-500/25 flex items-center justify-center active:scale-[0.98]"
-            title="Enviar mensaje al chat grupal"
+            title="Enviar al chat grupal"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2.2">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />

@@ -18,6 +18,7 @@ export interface CollaborationMessage {
   senderName: string;
   senderRole: 'user' | 'ai' | 'system';
   content: string;
+  imageUrl?: string | null;
   replyToUser?: string | null;
   actionSummary?: string | null;
   timestamp: string;

@@ -857,11 +857,11 @@ Manten las modificaciones minimas y enfocadas solo a lo que pidio el usuario.`;
       for (const relation of aiResponse.relations) {
         const umlRelation: UMLRelation = {
           id: relation.id || `relation-${Date.now()}-${Math.random()}`,
-          source: relation.sourceId,
-          target: relation.targetId,
+          source: relation.sourceId || relation.source,
+          target: relation.targetId || relation.target,
           type: this.mapRelationType(relation.type),
-          sourceCardinality: CardinalityUtils.parseCardinality(relation.sourceCardinality || '1'),
-          targetCardinality: CardinalityUtils.parseCardinality(relation.targetCardinality || '1'),
+          sourceCardinality: CardinalityUtils.parseCardinality(relation.sourceCardinality || relation.sourceMultiplicity || '1'),
+          targetCardinality: CardinalityUtils.parseCardinality(relation.targetCardinality || relation.targetMultiplicity || '1'),
           label: relation.label
         };
 
@@ -1016,6 +1016,193 @@ ${relationsDetail || '  (Ninguna relación creada aún)'}`;
         error: error instanceof Error ? error.message : 'Unknown error occurred'
       };
     }
+  }
+
+  // Analizar una imagen enviada en el chat con @ia (extraer/modificar diagrama UML o responder consulta visual como Mentor)
+  static async analyzeImageWithAI(
+    imageUrl: string,
+    userPrompt?: string,
+    currentDiagram?: UMLDiagram,
+    collaboration?: CollaborationContext
+  ): Promise<{
+    success: boolean;
+    diagram?: UMLDiagram;
+    explanation?: string;
+    error?: string;
+  }> {
+    try {
+      const userName = collaboration?.currentUserName || 'Compañero';
+      const collabContext = this.buildCollaborationContextPrompt(collaboration, currentDiagram);
+      const preservedDiagramName =
+        currentDiagram?.name &&
+        currentDiagram.name !== 'Generated UML Diagram' &&
+        currentDiagram.name !== 'Nuevo Diagrama'
+          ? currentDiagram.name
+          : collaboration?.projectName || 'Diagrama de clases';
+
+      const currentDiagramInfo =
+        currentDiagram && currentDiagram.entities.length > 0
+          ? `\nDIAGRAMA ACTUAL EN EL LIENZO ("${preservedDiagramName}"):\nTablas: ${currentDiagram.entities
+              .map(e => `${e.name}(${e.attributes.map(a => a.name + ':' + a.type).join(', ')})`)
+              .join('; ')}`
+          : '';
+
+      const systemPrompt = `Eres el **Mentor IA** experto en Ingeniería de Software y Diagramas UML del equipo.
+${collabContext}${currentDiagramInfo}
+
+El integrante **${userName}** ha compartido una imagen en el chat grupal etiquetándote con @ia.
+Tu tarea:
+1. Examina detalladamente la imagen adjunta y la instrucción de ${userName} ("${userPrompt || 'Extrae o genera el diagrama de clases de esta imagen y explícamelo'}").
+2. Si la imagen contiene un diagrama de clases, modelo entidad-relación, tablas de base de datos, pizarra, boceto o requisitos de tablas (y ${userName} no pidió explícitamente "solo explica sin cambiar el diagrama"), debes construir el objeto "diagram" completo con todas las tablas ("entities") y relaciones ("relations") detectadas.
+   - Si ${userName} pide "agregar" lo de la imagen al diagrama actual, conserva también las tablas del diagrama actual.
+   - PROHIBIDO incluir métodos ("methods": []). Solo tablas con "attributes".
+   - El campo "name" del diagrama DEBE ser exactamente "${preservedDiagramName}".
+3. Si ${userName} solo hizo una pregunta conceptual sobre la imagen sin querer reemplazar el lienzo, o si la imagen no tiene tablas/clases para modelar, devuelve "diagram": null y pon toda tu respuesta pedagógica en "explanation".
+4. En "explanation", dirígete siempre por su nombre a **${userName}**, explicale con claridad de mentor qué detectaste en la imagen, qué tablas y relaciones creaste (o responde su consulta) y dale algún consejo de diseño útil.
+
+Devuelve ÚNICAMENTE un JSON válido con esta estructura exacta (sin bloques markdown):
+{
+  "explanation": "Hola ${userName}, he analizado la imagen que compartiste...",
+  "diagram": {
+    "name": "${preservedDiagramName}",
+    "entities": [
+      {
+        "id": "entity-1",
+        "name": "NombreTabla",
+        "type": "class",
+        "attributes": [
+          { "id": "attr-1", "name": "id", "type": "int", "visibility": "private", "isKey": true }
+        ],
+        "methods": []
+      }
+    ],
+    "relations": [
+      {
+        "id": "relation-1",
+        "source": "entity-1",
+        "target": "entity-2",
+        "type": "association",
+        "sourceMultiplicity": "1",
+        "targetMultiplicity": "0..*",
+        "label": "tiene"
+      }
+    ]
+  }
+}`;
+
+      const response = await fetch(AI_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              role: 'system',
+              content: systemPrompt
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: userPrompt
+                    ? `[Enviado por ${userName}]: ${userPrompt}`
+                    : `[Enviado por ${userName}]: Analiza esta imagen, genera el diagrama de clases correspondiente en el lienzo y explícame qué encontraste.`
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: imageUrl
+                  }
+                }
+              ]
+            }
+          ],
+          model: DEFAULT_AI_MODEL,
+          temperature: 0.2,
+          max_completion_tokens: 4000,
+          stream: false
+        })
+      });
+
+      if (!response.ok) {
+        await this.handleFetchError(response, 'analyzeImageWithAI');
+      }
+
+      const data = await response.json();
+      const content = this.extractContent(data);
+      const cleaned = content
+        .replace(/```json\s*/gi, '')
+        .replace(/```\s*/g, '')
+        .trim();
+
+      let parsed: any = null;
+      try {
+        const firstBrace = cleaned.indexOf('{');
+        const lastBrace = cleaned.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+          parsed = JSON.parse(cleaned.substring(firstBrace, lastBrace + 1));
+        }
+      } catch {
+        // Si la IA respondió en texto libre en vez de JSON
+        return {
+          success: true,
+          explanation: content
+        };
+      }
+
+      if (parsed) {
+        let transformedDiagram: UMLDiagram | undefined = undefined;
+        if (parsed.diagram && Array.isArray(parsed.diagram.entities) && parsed.diagram.entities.length > 0) {
+          transformedDiagram = this.convertToUMLDiagram(parsed.diagram, preservedDiagramName);
+        }
+        return {
+          success: true,
+          diagram: transformedDiagram,
+          explanation:
+            parsed.explanation ||
+            `¡Listo **${userName}**! He analizado la imagen y generado el diagrama en el lienzo.`
+        };
+      }
+
+      return {
+        success: true,
+        explanation: content
+      };
+    } catch (error) {
+      console.error('Error analyzing image with AI:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Error al analizar la imagen con IA'
+      };
+    }
+  }
+
+  // Wrapper compatible con AIChatBot para analizar imágenes enviadas con @ia en el chat
+  static async analyzeChatImage(
+    imageUrl: string,
+    userPrompt?: string,
+    currentDiagram?: UMLDiagram,
+    collaboration?: CollaborationContext
+  ): Promise<{
+    success: boolean;
+    response?: string;
+    updatedDiagram?: UMLDiagram;
+    actionSummary?: string;
+    error?: string;
+  }> {
+    const res = await this.analyzeImageWithAI(imageUrl, userPrompt, currentDiagram, collaboration);
+    const actionSummary = res.diagram
+      ? `Actualizó el diagrama desde una imagen en el chat (${res.diagram.entities.length} tablas)`
+      : undefined;
+    return {
+      success: res.success,
+      response: res.explanation,
+      updatedDiagram: res.diagram,
+      actionSummary,
+      error: res.error
+    };
   }
 
   // Method to suggest improvements for existing diagrams
