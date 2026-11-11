@@ -14,9 +14,16 @@ export class ProjectExporter {
   private dbUsername: string;
   private dbPassword: string;
 
-  constructor(diagram: UMLDiagram, projectName = 'uml-generated-project', packageName = 'com.example.demo', dbName = 'my_database', dbUsername = 'postgres', dbPassword = 'postgres') {
+  constructor(diagram: UMLDiagram, projectName = 'uml-generated-project', packageName = 'com.example.demo', dbName = 'mi_basedatos', dbUsername = 'postgres', dbPassword = '1234') {
     this.diagram = diagram;
-    this.projectName = projectName;
+    const sanitizedProjectName = (projectName || 'uml-generated-project')
+      .trim()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'uml-generated-project';
+    this.projectName = sanitizedProjectName;
     this.packageName = packageName;
     this.dbName = dbName;
     this.dbUsername = dbUsername;
@@ -271,28 +278,20 @@ public class ${className} {
   private generateDockerfile(): ExportFile {
     return {
       path: 'Dockerfile',
-      content: `FROM openjdk:17-jdk-slim
-
+      content: `# Etapa 1: Build con Maven
+FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /app
-
-# Copy Maven wrapper and pom.xml
-COPY mvnw .
-COPY .mvn .mvn
 COPY pom.xml .
+RUN mvn dependency:go-offline -B
+COPY src ./src
+RUN mvn clean package -DskipTests
 
-# Download dependencies
-RUN chmod +x mvnw \
-  && ./mvnw dependency:go-offline -B
-
-# Copy source code
-COPY src src
-
-# Build application
-RUN ./mvnw clean package -DskipTests
-
-# Run application
+# Etapa 2: Imagen de ejecución
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
-CMD ["java", "-jar", "target/${this.projectName}-1.0.0.jar"]
+ENTRYPOINT ["java", "-jar", "app.jar"]
 `,
     };
   }
@@ -300,9 +299,7 @@ CMD ["java", "-jar", "target/${this.projectName}-1.0.0.jar"]
   private generateDockerCompose(): ExportFile {
     return {
       path: 'docker-compose.yml',
-      content: `version: '3.8'
-
-services:
+      content: `services:
   app:
     build: .
     ports:
@@ -311,8 +308,9 @@ services:
       - SPRING_DATASOURCE_URL=jdbc:postgresql://db:5432/${this.dbName}
       - SPRING_DATASOURCE_USERNAME=${this.dbUsername}
       - SPRING_DATASOURCE_PASSWORD=${this.dbPassword}
-    volumes:
-      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   db:
@@ -325,6 +323,11 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${this.dbUsername} -d ${this.dbName}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:
@@ -389,26 +392,26 @@ ${entity.attributes.filter(attr => attr.type === 'String').length > 0 ?
 
 2. **Run with Maven**:
    \`\`\`bash
-   ./mvnw spring-boot:run
+   mvn spring-boot:run
    \`\`\`
 
 3. **Or build and run the JAR**:
    \`\`\`bash
-   ./mvnw clean package
-   java -jar target/${this.projectName}-1.0.0.jar
+   mvn clean package -DskipTests
+   java -jar target/*.jar
    \`\`\`
 
 ### Using Docker
 
-1. **Build and run with Docker**:
+1. **Build and run with Docker Compose (Recommended)**:
+   \`\`\`bash
+   docker compose up --build
+   \`\`\`
+
+2. **Or build image standalone**:
    \`\`\`bash
    docker build -t ${this.projectName} .
    docker run -p 8080:8080 ${this.projectName}
-   \`\`\`
-
-2. **Or use Docker Compose**:
-   \`\`\`bash
-   docker-compose up
    \`\`\`
 
 ## Access Points
@@ -532,7 +535,7 @@ export async function exportAsZip(diagram: UMLDiagram, projectName?: string, pac
     // Ask for PostgreSQL DB configuration before exporting
     const dbName = typeof window !== 'undefined' ? (window.prompt('Nombre exacto de la base de datos (PostgreSQL):', 'mi_basedatos') || 'mi_basedatos') : 'mi_basedatos';
     const dbUsername = typeof window !== 'undefined' ? (window.prompt('Usuario de PostgreSQL:', 'postgres') || 'postgres') : 'postgres';
-    const dbPassword = typeof window !== 'undefined' ? (window.prompt('Password de PostgreSQL:', 'postgres') || 'postgres') : 'postgres';
+    const dbPassword = typeof window !== 'undefined' ? (window.prompt('Password de PostgreSQL:', '1234') || '1234') : '1234';
 
     console.log('Iniciando exportación del proyecto...');
     console.log('Diagrama:', diagram);

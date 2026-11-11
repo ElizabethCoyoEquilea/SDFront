@@ -12,8 +12,29 @@ export class SpringBootCodeGenerator {
   private packageName: string;
 
   constructor(diagram: UMLDiagram, packageName = 'com.example.demo') {
-    this.diagram = diagram;
+    // Clonar diagrama para no mutar el estado React en memoria durante el preprocesamiento
+    this.diagram = JSON.parse(JSON.stringify(diagram));
     this.packageName = packageName;
+  }
+
+  // Detecta si el nombre de un atributo primitivo (ej. venta_id, id_venta, ventaId, idVenta) corresponde a una FK hacia otra entidad
+  private findReferencedEntityByFkName(attrName: string, classEntities: UMLEntity[]): UMLEntity | undefined {
+    const attrSnake = this.toSnakeCase(attrName);
+    const attrLower = attrName.toLowerCase();
+
+    return classEntities.find((candidate) => {
+      const candSnake = this.toSnakeCase(candidate.name);
+      const candSafeSnake = this.safeSqlName(candSnake);
+      const candLower = candidate.name.toLowerCase();
+      return (
+        attrSnake === `${candSnake}_id` ||
+        attrSnake === `id_${candSnake}` ||
+        attrSnake === `${candSafeSnake}_id` ||
+        attrSnake === `id_${candSafeSnake}` ||
+        attrLower === `${candLower}id` ||
+        attrLower === `id${candLower}`
+      );
+    });
   }
 
   generateAll(): GeneratedFile[] {
@@ -39,42 +60,115 @@ export class SpringBootCodeGenerator {
         throw new Error('No hay entidades de tipo clase o abstracta para generar código');
       }
 
-      // --- NUEVO: Preprocesar relaciones para agregar atributos inversos ---
-      // Creamos un mapa de entidades para fácil acceso
+      // --- Preprocesar relaciones y limpiar atributos primitivos FK redundantes (ej. venta_id, ventaId) ---
       const entityMap: Record<string, UMLEntity> = {};
       classEntities.forEach(e => { entityMap[e.id] = e; });
 
-    // Para cada relación relevante, si es OneToMany, aseguramos el ManyToOne en el destino
-    this.diagram.relations.forEach((relation) => {
-      if (["association", "aggregation", "composition"].includes(relation.type)) {
-        const source = entityMap[relation.source];
-        const target = entityMap[relation.target];
-        if (!source || !target) return;
-        const sourceCard = relation.sourceCardinality;
-        const targetCard = relation.targetCardinality;
-        const isOneToMany = sourceCard.max === 1 && (targetCard.max === 'unlimited' || (typeof targetCard.max === 'number' && targetCard.max > 1));
-        if (isOneToMany) {
-            const sourceClassName = this.capitalize(source.name);
-            const fieldName = source.name.charAt(0).toLowerCase() + source.name.slice(1);
-            // Eliminar cualquier atributo Long con el mismo nombre antes de agregar la relación
-            target.attributes = target.attributes.filter(a => !(a.name === fieldName && a.type === 'Long'));
-            const alreadyExists = target.attributes.some(a => a.name === fieldName && a.type === sourceClassName);
-            if (!alreadyExists) {
-              // Agregar atributo con el nombre de la entidad como tipo
-              // El generador lo reconocerá como una relación ManyToOne
-              target.attributes.push({
-                id: `rel-${source.id}-${target.id}`,
-                name: fieldName,
-                // Usar el nombre de la clase como tipo (será detectado como entidad relacionada)
+      const ensureManyToOneAttribute = (manyEntity: UMLEntity, oneEntity: UMLEntity) => {
+        const oneClassName = this.capitalize(oneEntity.name);
+        const fieldName = this.toLowerCamelCase(oneEntity.name);
+        const oneSnake = this.toSnakeCase(oneEntity.name);
+        const oneSafeSnake = this.safeSqlName(oneSnake);
+
+        // Eliminar cualquier atributo primitivo redundante (ej. venta_id, id_venta, ventaId, venta)
+        manyEntity.attributes = manyEntity.attributes.filter((a) => {
+          if (a.name.toLowerCase() === 'id') return true;
+          const aSnake = this.toSnakeCase(a.name);
+          const aLower = a.name.toLowerCase();
+          const isEntityAttr = a.type.toLowerCase() === oneEntity.name.toLowerCase();
+          if (isEntityAttr) return true;
+          const isRedundantFk =
+            aLower === fieldName.toLowerCase() ||
+            aSnake === `${oneSnake}_id` ||
+            aSnake === `id_${oneSnake}` ||
+            aSnake === `${oneSafeSnake}_id` ||
+            aSnake === `id_${oneSafeSnake}` ||
+            aLower === `${oneEntity.name.toLowerCase()}id` ||
+            aLower === `id${oneEntity.name.toLowerCase()}`;
+          return !isRedundantFk;
+        });
+
+        const alreadyExists = manyEntity.attributes.some(
+          (a) => a.type.toLowerCase() === oneClassName.toLowerCase()
+        );
+        if (!alreadyExists) {
+          manyEntity.attributes.push({
+            id: `rel-${oneEntity.id}-${manyEntity.id}`,
+            name: fieldName,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            type: oneClassName as any,
+            visibility: 'private',
+            isKey: false
+          });
+        }
+      };
+
+      // 1. Procesar relaciones explícitas del diagrama (1:N y N:1)
+      this.diagram.relations.forEach((relation) => {
+        if (['association', 'aggregation', 'composition'].includes(relation.type)) {
+          const source = entityMap[relation.source];
+          const target = entityMap[relation.target];
+          if (!source || !target) return;
+          const sourceCard = relation.sourceCardinality;
+          const targetCard = relation.targetCardinality;
+          const sourceIsMany =
+            sourceCard.max === 'unlimited' ||
+            (typeof sourceCard.max === 'number' && sourceCard.max > 1);
+          const targetIsMany =
+            targetCard.max === 'unlimited' ||
+            (typeof targetCard.max === 'number' && targetCard.max > 1);
+
+          if (!sourceIsMany && targetIsMany) {
+            // 1 a N: target es el lado Muchos (tiene la FK hacia source)
+            ensureManyToOneAttribute(target, source);
+          } else if (sourceIsMany && !targetIsMany) {
+            // N a 1: source es el lado Muchos (tiene la FK hacia target)
+            ensureManyToOneAttribute(source, target);
+          }
+        }
+      });
+
+      // 2. Convertir o eliminar cualquier atributo primitivo FK suelto (ej. venta_id, producto_id) en todas las entidades
+      classEntities.forEach((entity) => {
+        const cleanedAttributes: UMLAttribute[] = [];
+        entity.attributes.forEach((attr) => {
+          if (attr.name.toLowerCase() === 'id') {
+            cleanedAttributes.push(attr);
+            return;
+          }
+          // Si ya es un atributo de tipo Entidad, conservarlo
+          const isEntityType = classEntities.some(
+            (ce) => ce.name.toLowerCase() === attr.type.toLowerCase()
+          );
+          if (isEntityType) {
+            cleanedAttributes.push(attr);
+            return;
+          }
+          // Verificar si el nombre del atributo es una FK primitiva hacia otra entidad (ej. venta_id -> Venta)
+          const refEntity = this.findReferencedEntityByFkName(attr.name, classEntities);
+          if (refEntity && refEntity.id !== entity.id) {
+            const refClassName = this.capitalize(refEntity.name);
+            const refFieldName = this.toLowerCamelCase(refEntity.name);
+            const alreadyHasRelation =
+              cleanedAttributes.some((a) => a.type.toLowerCase() === refClassName.toLowerCase()) ||
+              entity.attributes.some((a) => a.type.toLowerCase() === refClassName.toLowerCase());
+            if (!alreadyHasRelation) {
+              cleanedAttributes.push({
+                id: attr.id,
+                name: refFieldName,
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                type: sourceClassName as any,
+                type: refClassName as any,
                 visibility: 'private',
                 isKey: false
               });
             }
-        }
-      }
-    });
+            // Omitimos el campo primitivo xxx_id para no duplicar la columna con @JoinColumn(name = "xxx_id")
+            return;
+          }
+          cleanedAttributes.push(attr);
+        });
+        entity.attributes = cleanedAttributes;
+      });
 
       // Generate files for each class entity
       classEntities.forEach((entity) => {
@@ -106,40 +200,88 @@ export class SpringBootCodeGenerator {
     const className = this.capitalize(entity.name);
     const relations = this.getRelationsForEntity(entity.id);
 
-    // Determine id field: use user's 'id' attribute if present; otherwise generate Long id
-  const idAttr = entity.attributes.find((a) => a.name.toLowerCase() === 'id');
-  const useCustomId = !!idAttr;
-  const idJavaType = this.getEntityIdJavaType(entity);
+    // Determine id field: standardized to Long for numeric IDs so all FKs match Long -> Long
+    const idAttr = entity.attributes.find((a) => a.name.toLowerCase() === 'id');
+    const useCustomId = !!idAttr;
+    const idJavaType = this.getEntityIdJavaType(entity);
 
-  // Track required imports
+    // Track required imports
     const needLocalDate = entity.attributes.some(a => a.type === 'Date');
     const needLocalDateTime = entity.attributes.some(a => a.type === 'DateTime');
     const needBigDecimal = entity.attributes.some(a => a.type === 'BigDecimal');
     const needUUID = (useCustomId && idJavaType === 'UUID') || entity.attributes.some(a => a.type === 'UUID');
 
-    // Relationship fields impact imports
-  const relationStrings: string[] = [];
-  const relationFieldNames = new Set<string>();
+    // Control estricto de columnas y nombres de campos para evitar cualquier duplicado en Hibernate
+    const usedColumns = new Set<string>(['id']);
+    const usedFields = new Set<string>(['id']);
+
+    // Precompute attribute-based relation join columns and field names
+    const attrRelationNames = new Set<string>();
+    const entityRelationAttrs: UMLAttribute[] = [];
+    const scalarAttrs: UMLAttribute[] = [];
+
+    entity.attributes
+      .filter(a => a.name.toLowerCase() !== 'id')
+      .forEach(a => {
+        const rel = this.diagram.entities.find(
+          e => e.name.toLowerCase() === a.type.toLowerCase() && (e.type === 'class' || e.type === 'abstract')
+        );
+        if (rel) {
+          const fieldName = this.toLowerCamelCase(rel.name);
+          attrRelationNames.add(fieldName);
+          attrRelationNames.add(this.toLowerCamelCase(a.name));
+          entityRelationAttrs.push(a);
+        } else {
+          scalarAttrs.push(a);
+        }
+      });
+
+    // 1. Generar primero las relaciones basadas en atributos de entidad (@ManyToOne) y registrar sus @JoinColumn
+    const attributeRelationStrings: string[] = [];
+    entityRelationAttrs.forEach((attr) => {
+      const related = this.diagram.entities.find(
+        e => e.name.toLowerCase() === attr.type.toLowerCase() && (e.type === 'class' || e.type === 'abstract')
+      );
+      if (!related) return;
+      const fieldName = this.toLowerCamelCase(related.name);
+      const joinCol = `${this.safeSqlName(this.toSnakeCase(related.name))}_id`;
+      if (usedColumns.has(joinCol) || usedFields.has(fieldName)) {
+        return;
+      }
+      usedColumns.add(joinCol);
+      usedFields.add(fieldName);
+      attributeRelationStrings.push(`
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "${joinCol}")
+    @JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})
+    @EqualsAndHashCode.Exclude
+    @ToString.Exclude
+    @Schema(description = "Related ${related.name}")
+    private ${this.capitalize(related.name)} ${fieldName};
+`);
+    });
+
+    // 2. Generar las relaciones del diagrama (@OneToMany, @ManyToOne, @OneToOne, @ManyToMany) respetando usedColumns y usedFields
+    const relationStrings: string[] = [];
     let usesSet = false;
-    // Precompute attribute-based relation field names to avoid duplicates
-    const attrRelationNames = new Set(
-      entity.attributes
-        .filter(a => a.name.toLowerCase() !== 'id')
-        .map(a => {
-          const rel = this.diagram.entities.find(e => e.name.toLowerCase() === a.type.toLowerCase());
-          return rel ? a.name : '';
-        })
-        .filter(Boolean)
-    );
 
     relations.forEach((relation) => {
       const relatedEntity = this.diagram.entities.find(
         (ent) => ent.id === (relation.source === entity.id ? relation.target : relation.source)
       );
       if (relatedEntity && relatedEntity.type !== 'intermediate') {
-        const relStr = this.buildRelationshipField(entity, relatedEntity, relation, attrRelationNames);
-        if (relStr.includes('Set<')) usesSet = true;
-        relationStrings.push(relStr);
+        const relStr = this.buildRelationshipField(
+          entity,
+          relatedEntity,
+          relation,
+          attrRelationNames,
+          usedColumns,
+          usedFields
+        );
+        if (relStr) {
+          if (relStr.includes('Set<')) usesSet = true;
+          relationStrings.push(relStr);
+        }
       }
     });
 
@@ -148,6 +290,9 @@ export class SpringBootCodeGenerator {
       'import jakarta.persistence.*;',
       'import io.swagger.v3.oas.annotations.media.Schema;',
       'import lombok.Data;',
+      'import lombok.EqualsAndHashCode;',
+      'import lombok.ToString;',
+      'import com.fasterxml.jackson.annotation.JsonIgnoreProperties;'
     ];
     if (usesSet) {
       importLines.push('import java.util.Set;', 'import java.util.HashSet;');
@@ -157,70 +302,57 @@ export class SpringBootCodeGenerator {
     if (needBigDecimal) importLines.push('import java.math.BigDecimal;');
     if (needUUID) importLines.push('import java.util.UUID;');
 
-  let content = `package ${this.packageName}.entity;\n\n${importLines.join('\n')}\n\n@Data\n@Entity\n@Table(name = "${this.safeSqlName(this.toSnakeCase(entity.name))}")\npublic class ${className} {\n`;
+    let content = `package ${this.packageName}.entity;\n\n${importLines.join('\n')}\n\n@Data\n@Entity\n@Table(name = "${this.safeSqlName(this.toSnakeCase(entity.name))}")\npublic class ${className} {\n`;
 
     // Id field
     content += `\n    @Id\n`;
-    if (!useCustomId && idJavaType === 'Long') {
-      content += '    @GeneratedValue(strategy = GenerationType.IDENTITY)\n';
-    } else if (useCustomId && (idJavaType === 'Long' || idJavaType === 'Integer')) {
+    if (idJavaType === 'Long' || idJavaType === 'Integer') {
       content += '    @GeneratedValue(strategy = GenerationType.IDENTITY)\n';
     }
     content += `    @Schema(description = "Primary key")\n    private ${idJavaType} id;\n`;
 
-    // Generate attributes
-    entity.attributes.filter(attr => attr.name.toLowerCase() !== 'id').forEach((attr) => {
-      // Verificar si el tipo del atributo es una entidad relacionada
-      const related = this.diagram.entities.find(e => 
-        e.name.toLowerCase() === attr.type.toLowerCase() && 
-        (e.type === 'class' || e.type === 'abstract')
-      );
-      
-      if (related) {
-        // Attribute references another entity: generate ManyToOne instead of scalar field
-        const fieldName = attr.name;
-        const joinCol = `${this.toSnakeCase(fieldName)}_id`;
-        relationFieldNames.add(fieldName);
+    // 3. Generar atributos escalares simples omitiendo cualquier columna ya usada por @JoinColumn o duplicada
+    scalarAttrs.forEach((attr) => {
+      const colName = this.toSnakeCase(attr.name);
+      const fieldName = this.toLowerCamelCase(attr.name);
+      if (usedColumns.has(colName) || usedFields.has(fieldName)) {
+        return;
+      }
+      usedColumns.add(colName);
+      usedFields.add(fieldName);
+
+      try {
+        const javaType = this.mapDataType(attr.type);
+        const example = this.sampleValueForType(attr.type, this.capitalize(entity.name), fieldName);
+        const columnAnnotation = attr.isKey && fieldName !== 'id'
+          ? `@Column(name = "${colName}", unique = true)`
+          : `@Column(name = "${colName}")`;
+
         content += `
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "${joinCol}")
-    @Schema(description = "Related ${related.name}")
-    private ${this.capitalize(related.name)} ${fieldName};
-`;
-      } else {
-        // Es un tipo primitivo o no reconocido
-        try {
-          const javaType = this.mapDataType(attr.type);
-          const example = this.sampleValueForType(attr.type, this.capitalize(entity.name), attr.name);
-          const columnAnnotation = attr.isKey && attr.name !== 'id' 
-            ? `@Column(name = "${this.toSnakeCase(attr.name)}", unique = true)`
-            : `@Column(name = "${this.toSnakeCase(attr.name)}")`;
-          
-          content += `
     ${columnAnnotation}
-    @Schema(description = "${attr.name} field", example = "${example}")
-    private ${javaType} ${attr.name};
+    @Schema(description = "${fieldName} field", example = "${example}")
+    private ${javaType} ${fieldName};
 `;
-        } catch (error) {
-          console.error(`Error processing attribute ${attr.name} with type ${attr.type}:`, error);
-          // Usar String como fallback
-          content += `
-    @Column(name = "${this.toSnakeCase(attr.name)}")
-    @Schema(description = "${attr.name} field")
-    private String ${attr.name};
+      } catch (error) {
+        console.error(`Error processing attribute ${attr.name} with type ${attr.type}:`, error);
+        content += `
+    @Column(name = "${colName}")
+    @Schema(description = "${fieldName} field")
+    private String ${fieldName};
 `;
-        }
       }
     });
 
-    // Append relationship fields
-    // Add relation fields from edges, avoiding duplicates by field name
+    // 4. Agregar relaciones (@ManyToOne de atributos + relaciones de diagrama)
+    attributeRelationStrings.forEach(str => {
+      content += str;
+    });
     relationStrings.forEach(str => {
       content += str;
     });
 
-  // Ensure id accessor methods are present even if Lombok isn't processed
-  content += `
+    // Ensure id accessor methods are present even if Lombok isn't processed
+    content += `
   public ${idJavaType} getId() { return this.id; }
   public void setId(${idJavaType} id) { this.id = id; }
 }`;
@@ -232,38 +364,61 @@ export class SpringBootCodeGenerator {
     };
   }
 
-  private buildRelationshipField(entity: UMLEntity, relatedEntity: UMLEntity, relation: UMLRelation, attrRelationNames?: Set<string>): string {
+  private buildRelationshipField(
+    entity: UMLEntity,
+    relatedEntity: UMLEntity,
+    relation: UMLRelation,
+    attrRelationNames?: Set<string>,
+    usedColumns?: Set<string>,
+    usedFields?: Set<string>
+  ): string {
     const relatedClassName = this.capitalize(relatedEntity.name);
     const isSource = relation.source === entity.id;
     const sourceCard = relation.sourceCardinality;
     const targetCard = relation.targetCardinality;
 
-    const isOneToMany = sourceCard.max === 1 && (targetCard.max === 'unlimited' || (typeof targetCard.max === 'number' && targetCard.max > 1));
-    const isManyToOne = (sourceCard.max === 'unlimited' || (typeof sourceCard.max === 'number' && sourceCard.max > 1)) && targetCard.max === 1;
-    const isManyToMany = (sourceCard.max === 'unlimited' || (typeof sourceCard.max === 'number' && sourceCard.max > 1)) && (targetCard.max === 'unlimited' || (typeof targetCard.max === 'number' && targetCard.max > 1));
-    const isOneToOne = sourceCard.max === 1 && targetCard.max === 1;
+    const sourceIsMany = sourceCard.max === 'unlimited' || (typeof sourceCard.max === 'number' && sourceCard.max > 1);
+    const targetIsMany = targetCard.max === 'unlimited' || (typeof targetCard.max === 'number' && targetCard.max > 1);
 
-    if (relation.type === 'inheritance' && !isSource) {
-      // Note: Inheritance (extends) would require modifying class signature; omitted for simplicity here
+    const isOneToMany = !sourceIsMany && targetIsMany;
+    const isManyToOne = sourceIsMany && !targetIsMany;
+    const isManyToMany = sourceIsMany && targetIsMany;
+    const isOneToOne = !sourceIsMany && !targetIsMany;
+
+    if (relation.type === 'inheritance') {
       return '';
     }
 
     if (relation.type === 'composition' || relation.type === 'aggregation' || relation.type === 'association') {
-      // define field names
       const toManyName = `${this.toLowerCamelCase(relatedEntity.name)}Set`;
       const toOneName = this.toLowerCamelCase(relatedEntity.name);
-      // Skip if attribute already defined a field with same to-one name
-      if (attrRelationNames && (isManyToOne || isOneToOne) && attrRelationNames.has(toOneName)) {
-        return '';
-      }
+      const joinCol = `${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}_id`;
+
       if (isManyToMany) {
-        return `\n    @ManyToMany(cascade = CascadeType.ALL, fetch = FetchType.LAZY)\n    @JoinTable(\n        name = "${this.safeSqlName(this.toSnakeCase(entity.name))}_${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}",\n        joinColumns = @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(entity.name))}_id"),\n        inverseJoinColumns = @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}_id")\n    )\n    private Set<${relatedClassName}> ${toManyName} = new HashSet<>();\n`;
-      } else if (isOneToMany && isSource) {
-        return `\n    @OneToMany(mappedBy = "${this.toLowerCamelCase(entity.name)}", cascade = CascadeType.ALL, fetch = FetchType.LAZY)\n    private Set<${relatedClassName}> ${toManyName} = new HashSet<>();\n`;
-      } else if (isManyToOne && !isSource) {
-        return `\n    @ManyToOne(fetch = FetchType.LAZY)\n    @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}_id")\n    private ${relatedClassName} ${toOneName};\n`;
-      } else if (isOneToOne) {
-        return `\n    @OneToOne(fetch = FetchType.LAZY)\n    @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}_id")\n    private ${relatedClassName} ${toOneName};\n`;
+        if (usedFields?.has(toManyName)) return '';
+        usedFields?.add(toManyName);
+        return `\n    @ManyToMany(cascade = CascadeType.ALL, fetch = FetchType.LAZY)\n    @JoinTable(\n        name = "${this.safeSqlName(this.toSnakeCase(entity.name))}_${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}",\n        joinColumns = @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(entity.name))}_id"),\n        inverseJoinColumns = @JoinColumn(name = "${this.safeSqlName(this.toSnakeCase(relatedEntity.name))}_id")\n    )\n    @EqualsAndHashCode.Exclude\n    @ToString.Exclude\n    private Set<${relatedClassName}> ${toManyName} = new HashSet<>();\n`;
+      } else if ((isOneToMany && isSource) || (isManyToOne && !isSource)) {
+        if (usedFields?.has(toManyName)) return '';
+        usedFields?.add(toManyName);
+        return `\n    @OneToMany(mappedBy = "${this.toLowerCamelCase(entity.name)}", cascade = CascadeType.ALL, fetch = FetchType.LAZY)\n    @JsonIgnoreProperties("${this.toLowerCamelCase(entity.name)}")\n    @EqualsAndHashCode.Exclude\n    @ToString.Exclude\n    private Set<${relatedClassName}> ${toManyName} = new HashSet<>();\n`;
+      } else if ((isOneToMany && !isSource) || (isManyToOne && isSource)) {
+        if (attrRelationNames?.has(toOneName) || usedColumns?.has(joinCol) || usedFields?.has(toOneName)) {
+          return '';
+        }
+        usedColumns?.add(joinCol);
+        usedFields?.add(toOneName);
+        return `\n    @ManyToOne(fetch = FetchType.LAZY)\n    @JoinColumn(name = "${joinCol}")\n    @JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})\n    @EqualsAndHashCode.Exclude\n    @ToString.Exclude\n    private ${relatedClassName} ${toOneName};\n`;
+      } else if (isOneToOne && !isSource) {
+        const relatedHasFkToCurrent = relatedEntity.attributes.some(
+          a => a.type.toLowerCase() === entity.name.toLowerCase()
+        );
+        if (relatedHasFkToCurrent || attrRelationNames?.has(toOneName) || usedColumns?.has(joinCol) || usedFields?.has(toOneName)) {
+          return '';
+        }
+        usedColumns?.add(joinCol);
+        usedFields?.add(toOneName);
+        return `\n    @OneToOne(fetch = FetchType.LAZY)\n    @JoinColumn(name = "${joinCol}")\n    @JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})\n    @EqualsAndHashCode.Exclude\n    @ToString.Exclude\n    private ${relatedClassName} ${toOneName};\n`;
       }
     }
     return '';
@@ -271,12 +426,27 @@ export class SpringBootCodeGenerator {
 
   private getEntityIdJavaType(entity: UMLEntity): string {
     const idAttr = entity.attributes.find(a => a.name.toLowerCase() === 'id');
-    return idAttr ? this.mapDataType(idAttr.type) : 'Long';
+    if (idAttr) {
+      const mapped = this.mapDataType(idAttr.type);
+      if (mapped === 'UUID' || mapped === 'String') {
+        return mapped;
+      }
+    }
+    // Todas las claves primarias numéricas usan Long para coincidir con todas las claves foráneas (@JoinColumn)
+    return 'Long';
   }
 
   private generateRepository(entity: UMLEntity): GeneratedFile {
     const className = this.capitalize(entity.name);
-  const idType = this.getEntityIdJavaType(entity);
+    const idType = this.getEntityIdJavaType(entity);
+    const stringAttrs = entity.attributes.filter(attr => attr.type === 'String' && attr.name.toLowerCase() !== 'id');
+    const uniqueKeyAttrs = entity.attributes.filter(attr => {
+      if (!attr.isKey || attr.name.toLowerCase() === 'id') return false;
+      const isRel = this.diagram.entities.some(
+        e => e.name.toLowerCase() === attr.type.toLowerCase() && (e.type === 'class' || e.type === 'abstract')
+      );
+      return !isRel;
+    });
 
     const content = `package ${this.packageName}.repository;
 
@@ -289,18 +459,22 @@ import java.util.List;
 import java.util.Optional;
 
 @Repository
-  public interface ${className}Repository extends JpaRepository<${className}, ${idType}> {
+public interface ${className}Repository extends JpaRepository<${className}, ${idType}> {
     
     // Custom query methods based on attributes
-${entity.attributes.filter(attr => attr.type === 'String').map(attr => 
-    `    List<${className}> findBy${this.capitalize(attr.name)}ContainingIgnoreCase(String ${attr.name});`
-).join('\n')}
-${entity.attributes.filter(attr => attr.isKey && attr.name !== 'id').map(attr => 
-    `    Optional<${className}> findBy${this.capitalize(attr.name)}(${this.mapDataType(attr.type)} ${attr.name});`
-).join('\n')}
+${stringAttrs.map(attr => {
+    const fieldName = this.toLowerCamelCase(attr.name);
+    const capName = this.capitalize(fieldName);
+    return `    List<${className}> findBy${capName}ContainingIgnoreCase(String ${fieldName});`;
+}).join('\n')}
+${uniqueKeyAttrs.map(attr => {
+    const fieldName = this.toLowerCamelCase(attr.name);
+    const capName = this.capitalize(fieldName);
+    return `    Optional<${className}> findBy${capName}(${this.mapDataType(attr.type)} ${fieldName});`;
+}).join('\n')}
     
-  @Query("select e from ${className} e where e.id = :id")
-  Optional<${className}> findByIdWithDetails(@Param("id") ${idType} id);
+    @Query("select e from ${className} e where e.id = :id")
+    Optional<${className}> findByIdWithDetails(@Param("id") ${idType} id);
 }`;
 
     return {
@@ -313,7 +487,8 @@ ${entity.attributes.filter(attr => attr.isKey && attr.name !== 'id').map(attr =>
   private generateService(entity: UMLEntity): GeneratedFile {
     const className = this.capitalize(entity.name);
     const lowerClassName = this.toLowerCamelCase(className);
-  const idType = this.getEntityIdJavaType(entity);
+    const idType = this.getEntityIdJavaType(entity);
+    const stringAttrs = entity.attributes.filter(attr => attr.type === 'String' && attr.name.toLowerCase() !== 'id');
 
     const content = `package ${this.packageName}.service;
 
@@ -339,11 +514,11 @@ public class ${className}Service {
     }
     
     @Transactional(readOnly = true)
-  public Optional<${className}> findById(${idType} id) {
+    public Optional<${className}> findById(${idType} id) {
         return ${lowerClassName}Repository.findById(id);
     }
     
-  public Optional<${className}> findByIdWithDetails(${idType} id) {
+    public Optional<${className}> findByIdWithDetails(${idType} id) {
         return ${lowerClassName}Repository.findByIdWithDetails(id);
     }
     
@@ -351,24 +526,27 @@ public class ${className}Service {
         return ${lowerClassName}Repository.save(${lowerClassName});
     }
     
-  public ${className} update(${idType} id, ${className} ${lowerClassName}) {
+    public ${className} update(${idType} id, ${className} ${lowerClassName}) {
         ${lowerClassName}.setId(id);
         return ${lowerClassName}Repository.save(${lowerClassName});
     }
     
-  public void deleteById(${idType} id) {
+    public void deleteById(${idType} id) {
         ${lowerClassName}Repository.deleteById(id);
     }
     
-  public boolean existsById(${idType} id) {
+    public boolean existsById(${idType} id) {
         return ${lowerClassName}Repository.existsById(id);
     }
-${entity.attributes.filter(attr => attr.type === 'String').map(attr => `
+${stringAttrs.map(attr => {
+    const fieldName = this.toLowerCamelCase(attr.name);
+    const capName = this.capitalize(fieldName);
+    return `
     @Transactional(readOnly = true)
-    public List<${className}> searchBy${this.capitalize(attr.name)}(String ${attr.name}) {
-        return ${lowerClassName}Repository.findBy${this.capitalize(attr.name)}ContainingIgnoreCase(${attr.name});
-    }`
-).join('')}
+    public List<${className}> searchBy${capName}(String ${fieldName}) {
+        return ${lowerClassName}Repository.findBy${capName}ContainingIgnoreCase(${fieldName});
+    }`;
+}).join('')}
 }`;
 
     return {
@@ -381,8 +559,9 @@ ${entity.attributes.filter(attr => attr.type === 'String').map(attr => `
   private generateController(entity: UMLEntity): GeneratedFile {
     const className = this.capitalize(entity.name);
     const lowerClassName = this.toLowerCamelCase(className);
-  const pluralName = lowerClassName + 's';
+    const pluralName = lowerClassName + 's';
     const idType = this.getEntityIdJavaType(entity);
+    const stringAttrs = entity.attributes.filter(attr => attr.type === 'String' && attr.name.toLowerCase() !== 'id');
 
     const content = `package ${this.packageName}.controller;
 
@@ -490,18 +669,21 @@ public class ${className}Controller {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
-${entity.attributes.filter(attr => attr.type === 'String').map(attr => `
-  @GetMapping(value = "/search", params = "${attr.name}")
-  @Operation(summary = "Search ${className} by ${attr.name}")
-  public ResponseEntity<List<${className}>> searchBy${this.capitalize(attr.name)}(@RequestParam String ${attr.name}) {
+${stringAttrs.map(attr => {
+    const fieldName = this.toLowerCamelCase(attr.name);
+    const capName = this.capitalize(fieldName);
+    return `
+  @GetMapping(value = "/search", params = "${fieldName}")
+  @Operation(summary = "Search ${className} by ${fieldName}")
+  public ResponseEntity<List<${className}>> searchBy${capName}(@RequestParam String ${fieldName}) {
     try {
-      List<${className}> results = ${lowerClassName}Service.searchBy${this.capitalize(attr.name)}(${attr.name});
+      List<${className}> results = ${lowerClassName}Service.searchBy${capName}(${fieldName});
       return ResponseEntity.ok(results);
     } catch (Exception e) {
       return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
     }
-  }`
-).join('')}
+  }`;
+}).join('')}
 }`;
 
     return {
@@ -515,6 +697,7 @@ ${entity.attributes.filter(attr => attr.type === 'String').map(attr => `
     const className = this.capitalize(entity.name);
     const dtoClassName = `${className}DTO`;
     const idType = this.getEntityIdJavaType(entity);
+    const usedDtoFields = new Set<string>(['id']);
 
     let content = `package ${this.packageName}.dto;
 
@@ -529,17 +712,23 @@ public class ${dtoClassName} {
     private ${idType} id;
 `;
 
-    // Generate attributes (skip 'id' to avoid duplicates)
+    // Generate attributes (skip 'id' and avoid any duplicate fields)
     entity.attributes
       .filter(attr => attr.name.toLowerCase() !== 'id')
       .forEach((attr) => {
         const related = this.diagram.entities.find(e => e.name.toLowerCase() === attr.type.toLowerCase());
         if (related && related.type !== 'intermediate') {
-          // For relations in DTO, expose foreign key as <name>Id
-          content += `    private ${this.getEntityIdJavaType(related)} ${attr.name}Id;\n`;
+          // For relations in DTO, expose foreign key as <name>Id with matching PK type (Long)
+          const fkField = `${this.toLowerCamelCase(related.name)}Id`;
+          if (usedDtoFields.has(fkField)) return;
+          usedDtoFields.add(fkField);
+          content += `    private ${this.getEntityIdJavaType(related)} ${fkField};\n`;
         } else {
+          const fieldName = this.toLowerCamelCase(attr.name);
+          if (usedDtoFields.has(fieldName)) return;
+          usedDtoFields.add(fieldName);
           const javaType = this.mapDataType(attr.type);
-          content += `    private ${javaType} ${attr.name};\n`;
+          content += `    private ${javaType} ${fieldName};\n`;
         }
       });
 
@@ -637,18 +826,34 @@ public class CorsConfig {
   }
 
   private capitalize(str: string): string {
-    return str.charAt(0).toUpperCase() + str.slice(1);
+    if (!str) return '';
+    const camel = this.toLowerCamelCase(str);
+    return camel.charAt(0).toUpperCase() + camel.slice(1);
   }
 
   private toLowerCamelCase(str: string): string {
-    return str.charAt(0).toLowerCase() + str.slice(1);
+    if (!str) return '';
+    const cleaned = str.trim();
+    if (cleaned.includes('_') || cleaned.includes(' ') || cleaned.includes('-')) {
+      return cleaned
+        .toLowerCase()
+        .split(/[_\s-]+/)
+        .filter(Boolean)
+        .map((part, idx) => (idx === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+        .join('');
+    }
+    return cleaned.charAt(0).toLowerCase() + cleaned.slice(1);
   }
 
   private toSnakeCase(str: string): string {
+    if (!str) return '';
     return str
-      .replace(/([A-Z])/g, '_$1')
+      .trim()
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .replace(/[\s-]+/g, '_')
+      .replace(/_+/g, '_')
       .toLowerCase()
-      .replace(/^_/, '');
+      .replace(/^_|_$/g, '');
   }
 
   // Avoid SQL reserved keywords by pluralizing simple cases (order->orders, user->users, role->roles)
@@ -710,17 +915,19 @@ public class CorsConfig {
         );
         
         if (related) {
-          // For relations, show only foreign key id reference
-          return `"${a.name}Id": 1`;
+          // For relations, show nested object with id reference matching JPA entity binding
+          const relField = this.toLowerCamelCase(related.name);
+          return `"${relField}": {"id": 1}`;
         }
         
+        const fieldName = this.toLowerCamelCase(a.name);
         try {
-          const val = this.sampleValueForType(a.type, this.capitalize(entity.name), a.name);
+          const val = this.sampleValueForType(a.type, this.capitalize(entity.name), fieldName);
           const needsQuotes = !(['Integer','Long','Double','Float','Boolean','BigDecimal'].includes(a.type));
-          return needsQuotes ? `"${a.name}": "${val}"` : `"${a.name}": ${val}`;
+          return needsQuotes ? `"${fieldName}": "${val}"` : `"${fieldName}": ${val}`;
         } catch (error) {
           console.error(`Error building example for attribute ${a.name}:`, error);
-          return `"${a.name}": "example_value"`;
+          return `"${fieldName}": "example_value"`;
         }
       });
     return `{${entries.join(', ')}}`;
